@@ -176,6 +176,13 @@ void setup() {
 
   ledcAttach(servoPin, 50, 16);             // 舵机 50Hz 16bit（core 3.x API）
   servoWrite(SCAN_CENTER);                  // 舵机回中
+  // 开机自检：左右扫两下，肉眼确认舵机已驱动（扫完回中）
+  for (int i = 0; i < 2; i++) {
+    servoWrite(SCAN_RIGHT); delay(300);
+    servoWrite(SCAN_LEFT);  delay(300);
+  }
+  servoWrite(SCAN_CENTER);
+  Serial.println("servo sweep done");
 
   BLEDevice::init("RobotCar");
   BLEDevice::setPower(ESP_PWR_LVL_P9);   // 最大发射功率，增强连接稳定性

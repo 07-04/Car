@@ -1,7 +1,7 @@
 // ESP32-S3 单板：BLE 遥控 + 超声波/红外自主避障（直接控制 TB6612 D24A）
 // 手机 BLE App -> ESP32-S3 -> D24A -> 电机
 // 电机引脚：左组 pwmL=GPIO4, in1L=GPIO5, in2L=GPIO6；右组 pwmR=GPIO7, in1R=GPIO8, in2R=GPIO9
-// 避障传感器：HC-SR04 Trig=GPIO10 Echo=GPIO11；KY-032 左=GPIO12 右=GPIO13（OUT 低电平=有障碍）
+// 避障传感器：HC-SR04 Trig=GPIO10 Echo=GPIO11（装在 SG90 舵机上左右扫描）；KY-032 左=GPIO12 右=GPIO13（OUT 低电平=有障碍）
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -20,6 +20,7 @@ const int trigPin = 10;   // HC-SR04 Trig（3.3V 直连）
 const int echoPin = 11;   // HC-SR04 Echo（3.3V 供电直连，无分压）
 const int irLeft  = 12;   // KY-032 左（OUT 低电平 = 有障碍）
 const int irRight = 13;   // KY-032 右
+const int servoPin = 14;  // SG90 舵机（带动 HC-SR04 左右扫描）
 
 int speed = 70;           // 当前速度（30~110，对应按键 1~9）
 const int avoidDist = 30; // 前方避障触发距离（cm）
@@ -32,6 +33,13 @@ int  avoidState = 0;               // 0=直行 1=左转 2=右转 3=后退
 unsigned long stateEnd = 0;
 const unsigned long TURN_MS = 450; // 转向最短 450ms
 const unsigned long BACK_MS = 350; // 后退最短 350ms
+
+// 舵机扫描（0~180°，LEFT/RIGHT 需按实际安装方向调整，装反就互换两者）
+const int SCAN_LEFT   = 150;
+const int SCAN_CENTER = 90;
+const int SCAN_RIGHT  = 30;
+const int SCAN_SETTLE = 130;                  // 舵机到位后等待 ms
+int distL = 999, distC = 999, distR = 999;    // 左/中/右三方向距离（cm，999=无回波视为远）
 
 BLECharacteristic *pTxChar;
 bool deviceConnected = false;
@@ -69,15 +77,25 @@ long readDistance() {          // 返回前方距离（cm），超时返回 999
 bool leftBlocked()  { return digitalRead(irLeft)  == LOW; }   // KY-032 低电平 = 有障碍
 bool rightBlocked() { return digitalRead(irRight) == LOW; }
 
+// ---- 舵机 + 三方向扫描 ----
+void servoWrite(int angle) {
+  int us = map(angle, 0, 180, 500, 2500);            // SG90: 500us(0°) ~ 2500us(180°)
+  ledcWrite(servoPin, (uint32_t)us * 65536 / 20000); // 50Hz 16bit 换算成 duty
+}
+
+void scan() {                                        // 左→中→右各读一次，最后回中
+  servoWrite(SCAN_LEFT);   delay(SCAN_SETTLE); distL = readDistance();
+  servoWrite(SCAN_CENTER); delay(SCAN_SETTLE); distC = readDistance();
+  servoWrite(SCAN_RIGHT);  delay(SCAN_SETTLE); distR = readDistance();
+  servoWrite(SCAN_CENTER);
+}
+
 // ---- 自主避障一步 ----
 void avoidStep() {
-  long dist = readDistance();
-  bool l = leftBlocked();
-  bool r = rightBlocked();
+  bool irL = leftBlocked();
+  bool irR = rightBlocked();
 
-  Serial.printf("dist=%ldcm L=%d R=%d st=%d\n", dist, l, r, avoidState);
-
-  // 正在执行带时长的动作，先跑完再重新判断
+  // 正在执行带时长的动作（转向/后退），先跑完再重新判断
   if (avoidState != 0 && millis() < stateEnd) {
     if (avoidState == 1)      turnLeft();
     else if (avoidState == 2) turnRight();
@@ -86,19 +104,27 @@ void avoidStep() {
   }
   avoidState = 0;
 
-  if (dist > 0 && dist < avoidDist) {          // 前方有障碍
-    if (dist < backDist) {                     // 太近：先退
+  scan();   // 舵机左→中→右扫描，得到 distL/distC/distR
+
+  Serial.printf("L=%d C=%d R=%d irL=%d irR=%d st=%d\n", distL, distC, distR, irL, irR, avoidState);
+
+  if (distC < backDist) {                              // 正前方太近：后退
+    avoidState = 3; stateEnd = millis() + BACK_MS; backward();
+  } else if (distC < avoidDist) {                      // 前方有障碍
+    if (distL < avoidDist && distR < avoidDist) {      // 三面都堵：后退
       avoidState = 3; stateEnd = millis() + BACK_MS; backward();
-    } else if (l && r) {                       // 死胡同：先退
-      avoidState = 3; stateEnd = millis() + BACK_MS; backward();
-    } else if (l) {                            // 左挡右空：右转
-      avoidState = 2; stateEnd = millis() + TURN_MS; turnRight();
-    } else {                                   // 右挡或都空：左转
+    } else if (distL >= distR) {                       // 左边更空旷：左转
       avoidState = 1; stateEnd = millis() + TURN_MS; turnLeft();
+    } else {                                           // 右边更空旷：右转
+      avoidState = 2; stateEnd = millis() + TURN_MS; turnRight();
     }
-  } else if (l && !r) turnRight();             // 前方空，左挡：右偏
-  else if (r && !l)   turnLeft();              // 前方空，右挡：左偏
-  else                forward();               // 都空（或都挡，窄缝直行）
+  } else if (irL && !irR) {                            // 前方空，左红外兜底挡：右转
+    avoidState = 2; stateEnd = millis() + TURN_MS; turnRight();
+  } else if (irR && !irL) {                            // 前方空，右红外兜底挡：左转
+    avoidState = 1; stateEnd = millis() + TURN_MS; turnLeft();
+  } else {
+    forward();                                          // 都空，直行（含窄缝两侧都挡）
+  }
 }
 
 void handleCmd(char c) {
@@ -148,6 +174,9 @@ void setup() {
   pinMode(irLeft, INPUT);
   pinMode(irRight, INPUT);
 
+  ledcAttach(servoPin, 50, 16);             // 舵机 50Hz 16bit（core 3.x API）
+  servoWrite(SCAN_CENTER);                  // 舵机回中
+
   BLEDevice::init("RobotCar");
   BLEDevice::setPower(ESP_PWR_LVL_P9);   // 最大发射功率，增强连接稳定性
   BLEServer *pServer = BLEDevice::createServer();
@@ -171,6 +200,11 @@ void loop() {
     avoidStep();
     delay(50);        // 小步进，连续避障
   } else {
+    static unsigned long lastDbg = 0;
+    if (millis() - lastDbg >= 500) {           // 手动模式也每 0.5s 打印一次传感器，便于诊断
+      lastDbg = millis();
+      Serial.printf("idle dist=%ldcm L=%d R=%d\n", readDistance(), (int)leftBlocked(), (int)rightBlocked());
+    }
     delay(10);
   }
 }

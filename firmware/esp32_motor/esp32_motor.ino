@@ -99,7 +99,7 @@ void handleCmd(char c) {
 
 class ServerCb : public BLEServerCallbacks {
   void onConnect(BLEServer* s)    { deviceConnected = true; autoMode = false; stopAll(); Serial.println("BT connected"); }
-  void onDisconnect(BLEServer* s) { deviceConnected = false; autoMode = false; stopAll(); Serial.println("BT disconnected"); }  // 断连自动停车并退出避障
+  void onDisconnect(BLEServer* s) { deviceConnected = false; autoMode = false; stopAll(); Serial.println("BT disconnected"); s->getAdvertising()->start(); }  // 断连自动停车 + 重新广播
 };
 
 class WriteCb : public BLECharacteristicCallbacks {
@@ -127,6 +127,7 @@ void setup() {
   pinMode(irRight, INPUT);
 
   BLEDevice::init("RobotCar");
+  BLEDevice::setPower(ESP_PWR_LVL_P9);   // 最大发射功率，增强连接稳定性
   BLEServer *pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ServerCb());
 

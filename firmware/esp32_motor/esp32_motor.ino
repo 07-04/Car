@@ -22,9 +22,16 @@ const int irLeft  = 12;   // KY-032 左（OUT 低电平 = 有障碍）
 const int irRight = 13;   // KY-032 右
 
 int speed = 70;           // 当前速度（30~110，对应按键 1~9）
-const int avoidDist = 25; // 前方避障触发距离（cm）
+const int avoidDist = 30; // 前方避障触发距离（cm）
+const int backDist  = 15; // 太近（<15cm）先强制后退再转
 
 bool autoMode = false;    // 自主避障模式（BLE 'A' 开启，'S'/方向键关闭）
+
+// 避障状态机（转向/后退有最短持续时间，避免“刚转一点又往前撞”）
+int  avoidState = 0;               // 0=直行 1=左转 2=右转 3=后退
+unsigned long stateEnd = 0;
+const unsigned long TURN_MS = 450; // 转向最短 450ms
+const unsigned long BACK_MS = 350; // 后退最短 350ms
 
 BLECharacteristic *pTxChar;
 bool deviceConnected = false;
@@ -68,14 +75,29 @@ void avoidStep() {
   bool l = leftBlocked();
   bool r = rightBlocked();
 
-  Serial.printf("dist=%ldcm L=%d R=%d\n", dist, l, r);
+  Serial.printf("dist=%ldcm L=%d R=%d st=%d\n", dist, l, r, avoidState);
 
-  if (dist > 0 && dist < avoidDist) {          // 前方近距离有障碍
-    if (l && r)       { setLeft(-speed); setRight(0); }  // 三面挡（死胡同）：后退左转
-    else if (l)       turnRight();             // 左挡右空 → 右转
-    else              turnLeft();              // 右挡或都空 → 左转
-  } else if (l && !r) turnRight();             // 前方空，左挡 → 右偏
-  else if (r && !l)   turnLeft();              // 前方空，右挡 → 左偏
+  // 正在执行带时长的动作，先跑完再重新判断
+  if (avoidState != 0 && millis() < stateEnd) {
+    if (avoidState == 1)      turnLeft();
+    else if (avoidState == 2) turnRight();
+    else                      backward();
+    return;
+  }
+  avoidState = 0;
+
+  if (dist > 0 && dist < avoidDist) {          // 前方有障碍
+    if (dist < backDist) {                     // 太近：先退
+      avoidState = 3; stateEnd = millis() + BACK_MS; backward();
+    } else if (l && r) {                       // 死胡同：先退
+      avoidState = 3; stateEnd = millis() + BACK_MS; backward();
+    } else if (l) {                            // 左挡右空：右转
+      avoidState = 2; stateEnd = millis() + TURN_MS; turnRight();
+    } else {                                   // 右挡或都空：左转
+      avoidState = 1; stateEnd = millis() + TURN_MS; turnLeft();
+    }
+  } else if (l && !r) turnRight();             // 前方空，左挡：右偏
+  else if (r && !l)   turnLeft();              // 前方空，右挡：左偏
   else                forward();               // 都空（或都挡，窄缝直行）
 }
 
